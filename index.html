@@ -107,6 +107,10 @@
   .event .n{font-size:1.12rem;font-weight:300;flex:1}
   .event .del{opacity:0;cursor:pointer;color:var(--faint);font-size:.85rem;transition:opacity .2s}
   .event:hover .del{opacity:1}
+  .event .gtag{
+    font-size:.62rem;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);
+    border:1px solid var(--line);border-radius:99px;padding:.1rem .45rem;margin-left:.5rem;vertical-align:middle;
+  }
   .empty{color:var(--faint);font-style:italic;font-weight:300}
   #tasks{align-self:start;justify-self:end;text-align:right;margin-top:1rem;max-width:26rem}
   .task{font-size:1.05rem;font-weight:300;padding:.5rem 0;display:flex;justify-content:flex-end;align-items:baseline;gap:.6rem}
@@ -154,6 +158,7 @@
     cursor:pointer;font-size:.8rem;margin-top:.4rem;
   }
   #syncNote{font-size:.72rem;color:#999;margin-top:.6rem;line-height:1.4}
+  #calStatus{font-size:.72rem;color:#999;margin-top:.4rem;line-height:1.4}
   #skyswitch{position:fixed;bottom:1rem;left:1rem;z-index:9;display:none;gap:.4rem}
   body.demo #skyswitch{display:flex}
   #skyswitch button{
@@ -259,7 +264,9 @@
     <div id="authStatus">Not signed in — changes stay on this device only.</div>
     <button id="signInBtn">Sign in with Google</button>
     <button id="signOutBtn" style="display:none">Sign out</button>
-    <div id="syncNote">Sign in with the same Google account on every device (PC and iPad) so they see the same tasks and events.</div>
+    <button id="calRefreshBtn" style="display:none">Refresh Google Calendar</button>
+    <div id="calStatus"></div>
+    <div id="syncNote">Sign in with the same Google account on every device (PC and iPad) so they see the same tasks and events. Today's real Google Calendar events show automatically alongside anything you add here.</div>
   </div>
 </div>
 
@@ -444,6 +451,11 @@ const DEMO_TASKS = [
 let localEvents = JSON.parse(JSON.stringify(DEMO_EVENTS));
 let localTasks = JSON.parse(JSON.stringify(DEMO_TASKS));
 let unsubEvents = null, unsubTasks = null;
+let baseEvents = [];
+let googleEvents = [];
+let googleAccessToken = null;
+let googleTokenExpiry = 0;
+let googleCalPollTimer = null;
 
 function todayStr(){
   const n = new Date();
@@ -469,10 +481,18 @@ function renderEvents(list){
   sorted.forEach(e=>{
     const row = document.createElement("div");
     row.className = "event";
-    row.innerHTML = `<div class="t">${fmtTime(e.time)}</div><div class="n">${e.title}</div><div class="del" data-id="${e.id}">remove</div>`;
-    row.querySelector(".del").addEventListener("click", ()=> deleteEvent(e.id));
+    const gtag = e.source === "google" ? `<span class="gtag">Google</span>` : "";
+    const del = e.source === "google" ? "" : `<div class="del" data-id="${e.id}">remove</div>`;
+    row.innerHTML = `<div class="t">${fmtTime(e.time)}</div><div class="n">${e.title}${gtag}</div>${del}`;
+    if (e.source !== "google"){
+      row.querySelector(".del").addEventListener("click", ()=> deleteEvent(e.id));
+    }
     ev.appendChild(row);
   });
+}
+
+function renderCombinedEvents(){
+  renderEvents(baseEvents.concat(googleEvents));
 }
 
 function renderTasks(list){
@@ -488,7 +508,8 @@ function renderTasks(list){
 }
 
 function startLocalMode(){
-  renderEvents(localEvents.filter(e => !e.date || e.date === todayStr()));
+  baseEvents = localEvents.filter(e => !e.date || e.date === todayStr());
+  renderCombinedEvents();
   renderTasks(localTasks);
 }
 
@@ -499,17 +520,23 @@ function startFirestoreListeners(uid){
   unsubEvents = db.collection("users").doc(uid).collection("events")
     .where("date","==",today)
     .onSnapshot(snap=>{
-      const list = [];
-      snap.forEach(doc=> list.push({id:doc.id, ...doc.data()}));
-      renderEvents(list);
-    }, err=>{ console.warn("events listener error", err); });
+      baseEvents = [];
+      snap.forEach(doc=> baseEvents.push({id:doc.id, ...doc.data()}));
+      renderCombinedEvents();
+    }, err=>{
+      console.warn("events listener error", err);
+      document.getElementById("authStatus").textContent = "Sync error (events): " + err.message;
+    });
   unsubTasks = db.collection("users").doc(uid).collection("tasks")
     .orderBy("createdAt","asc")
     .onSnapshot(snap=>{
       const list = [];
       snap.forEach(doc=> list.push({id:doc.id, ...doc.data()}));
       renderTasks(list);
-    }, err=>{ console.warn("tasks listener error", err); });
+    }, err=>{
+      console.warn("tasks listener error", err);
+      document.getElementById("authStatus").textContent = "Sync error (tasks): " + err.message;
+    });
 }
 
 function addEvent(time, title){
@@ -517,7 +544,7 @@ function addEvent(time, title){
   if (currentUser){
     db.collection("users").doc(currentUser.uid).collection("events").add({
       time, title, date: todayStr(), createdAt: Date.now()
-    });
+    }).catch(err=> alert("Couldn't save event: " + err.message));
   } else {
     localEvents.push({id:"local-"+Date.now(), time, title, date: todayStr()});
     startLocalMode();
@@ -525,7 +552,8 @@ function addEvent(time, title){
 }
 function deleteEvent(id){
   if (currentUser){
-    db.collection("users").doc(currentUser.uid).collection("events").doc(id).delete();
+    db.collection("users").doc(currentUser.uid).collection("events").doc(id).delete()
+      .catch(err=> alert("Couldn't remove event: " + err.message));
   } else {
     localEvents = localEvents.filter(e=>e.id!==id);
     startLocalMode();
@@ -536,7 +564,7 @@ function addTask(title){
   if (currentUser){
     db.collection("users").doc(currentUser.uid).collection("tasks").add({
       title, createdAt: Date.now()
-    });
+    }).catch(err=> alert("Couldn't save task: " + err.message));
   } else {
     localTasks.push({id:"local-"+Date.now(), title});
     startLocalMode();
@@ -544,11 +572,85 @@ function addTask(title){
 }
 function deleteTask(id){
   if (currentUser){
-    db.collection("users").doc(currentUser.uid).collection("tasks").doc(id).delete();
+    db.collection("users").doc(currentUser.uid).collection("tasks").doc(id).delete()
+      .catch(err=> alert("Couldn't remove task: " + err.message));
   } else {
     localTasks = localTasks.filter(t=>t.id!==id);
     startLocalMode();
   }
+}
+
+/* ---------- Google Calendar (real events, read-only) ---------- */
+function setGoogleCalendarToken(token){
+  googleAccessToken = token;
+  googleTokenExpiry = Date.now() + 55*60*1000; // Google access tokens last ~1hr
+  document.getElementById("calRefreshBtn").style.display = "inline-block";
+  if (googleCalPollTimer) clearInterval(googleCalPollTimer);
+  fetchGoogleCalendarEvents();
+  googleCalPollTimer = setInterval(()=>{
+    if (Date.now() > googleTokenExpiry){
+      clearInterval(googleCalPollTimer);
+      document.getElementById("calStatus").textContent =
+        "Google Calendar sync expired — click \"Refresh Google Calendar\" to reconnect.";
+      return;
+    }
+    fetchGoogleCalendarEvents();
+  }, 5*60*1000);
+}
+
+async function fetchGoogleCalendarEvents(){
+  if (!googleAccessToken) return;
+  try {
+    const start = new Date(); start.setHours(0,0,0,0);
+    const end = new Date(); end.setHours(23,59,59,999);
+    const params = new URLSearchParams({
+      timeMin: start.toISOString(),
+      timeMax: end.toISOString(),
+      singleEvents: "true",
+      orderBy: "startTime",
+      maxResults: "20"
+    });
+    const res = await fetch(
+      `https://www.googleapis.com/calendar/v3/calendars/primary/events?${params}`,
+      { headers: { Authorization: "Bearer " + googleAccessToken } }
+    );
+    if (res.status === 401){
+      googleAccessToken = null;
+      googleEvents = [];
+      renderCombinedEvents();
+      document.getElementById("calStatus").textContent =
+        "Google Calendar sync expired — click \"Refresh Google Calendar\" to reconnect.";
+      return;
+    }
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    googleEvents = (data.items || []).map(ev=>{
+      let time = "";
+      if (ev.start && ev.start.dateTime){
+        const d = new Date(ev.start.dateTime);
+        time = String(d.getHours()).padStart(2,"0") + ":" + String(d.getMinutes()).padStart(2,"0");
+      }
+      return { id: "g-" + ev.id, time, title: ev.summary || "(untitled)", source: "google" };
+    });
+    renderCombinedEvents();
+    document.getElementById("calStatus").textContent =
+      "Google Calendar connected — synced " + new Date().toLocaleTimeString();
+  } catch (err){
+    console.warn("Google Calendar fetch error", err);
+    document.getElementById("calStatus").textContent = "Couldn't reach Google Calendar.";
+  }
+}
+
+function connectGoogleCalendar(){
+  const provider = new firebase.auth.GoogleAuthProvider();
+  provider.addScope("https://www.googleapis.com/auth/calendar.readonly");
+  provider.setCustomParameters({ prompt: "consent" });
+  return auth.signInWithPopup(provider).then(result=>{
+    const credential = firebase.auth.GoogleAuthProvider.credentialFromResult(result);
+    if (credential && credential.accessToken){
+      setGoogleCalendarToken(credential.accessToken);
+    }
+  });
 }
 
 /* ---------- auth ---------- */
@@ -575,14 +677,21 @@ if (firebaseReady){
       document.body.classList.remove("demo");
       startFirestoreListeners(user.uid);
     } else {
+      if (googleCalPollTimer) clearInterval(googleCalPollTimer);
+      googleAccessToken = null;
+      googleEvents = [];
+      document.getElementById("calRefreshBtn").style.display = "none";
+      document.getElementById("calStatus").textContent = "";
       startLocalMode();
     }
   });
   document.getElementById("signInBtn").addEventListener("click", ()=>{
-    const provider = new firebase.auth.GoogleAuthProvider();
-    auth.signInWithPopup(provider).catch(err=> alert("Sign-in error: "+err.message));
+    connectGoogleCalendar().catch(err=> alert("Sign-in error: "+err.message));
   });
   document.getElementById("signOutBtn").addEventListener("click", ()=> auth.signOut());
+  document.getElementById("calRefreshBtn").addEventListener("click", ()=>{
+    connectGoogleCalendar().catch(err=> alert("Google Calendar connect error: "+err.message));
+  });
 } else {
   document.body.classList.add("demo");
   document.getElementById("authStatus").textContent = "Firebase isn\'t configured yet - running in demo mode.";
