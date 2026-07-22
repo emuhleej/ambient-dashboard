@@ -448,8 +448,10 @@ const DEMO_TASKS = [
   {id:"t3", title:"Water the porch plants"}
 ];
 
-let localEvents = JSON.parse(JSON.stringify(DEMO_EVENTS));
-let localTasks = JSON.parse(JSON.stringify(DEMO_TASKS));
+/* Sample data only appears when Firebase isn't configured (true demo mode);
+   on the real site, signed out just means empty lists, not fake events. */
+let localEvents = firebaseReady ? [] : JSON.parse(JSON.stringify(DEMO_EVENTS));
+let localTasks = firebaseReady ? [] : JSON.parse(JSON.stringify(DEMO_TASKS));
 let unsubEvents = null, unsubTasks = null;
 let baseEvents = [];
 let googleEvents = [];
@@ -581,9 +583,10 @@ function deleteTask(id){
 }
 
 /* ---------- Google Calendar (real events, read-only) ---------- */
-function setGoogleCalendarToken(token){
+function setGoogleCalendarToken(token, expiry){
   googleAccessToken = token;
-  googleTokenExpiry = Date.now() + 55*60*1000; // Google access tokens last ~1hr
+  googleTokenExpiry = expiry || (Date.now() + 55*60*1000); // Google access tokens last ~1hr
+  try { localStorage.setItem("gcalToken", JSON.stringify({t: token, exp: googleTokenExpiry})); } catch(e){}
   document.getElementById("calRefreshBtn").style.display = "inline-block";
   if (googleCalPollTimer) clearInterval(googleCalPollTimer);
   fetchGoogleCalendarEvents();
@@ -617,6 +620,7 @@ async function fetchGoogleCalendarEvents(){
     if (res.status === 401){
       googleAccessToken = null;
       googleEvents = [];
+      try { localStorage.removeItem("gcalToken"); } catch(e){}
       renderCombinedEvents();
       document.getElementById("calStatus").textContent =
         "Google Calendar sync expired — click \"Refresh Google Calendar\" to reconnect.";
@@ -646,11 +650,31 @@ function connectGoogleCalendar(){
   provider.addScope("https://www.googleapis.com/auth/calendar.readonly");
   provider.setCustomParameters({ prompt: "consent" });
   return auth.signInWithPopup(provider).then(result=>{
-    const credential = firebase.auth.GoogleAuthProvider.credentialFromResult(result);
+    let credential = result.credential; // compat SDK puts the OAuth credential here
+    if (!credential && firebase.auth.GoogleAuthProvider.credentialFromResult){
+      try { credential = firebase.auth.GoogleAuthProvider.credentialFromResult(result); } catch(e){}
+    }
     if (credential && credential.accessToken){
       setGoogleCalendarToken(credential.accessToken);
+    } else {
+      document.getElementById("calStatus").textContent =
+        "Signed in, but Google didn't return calendar access — check that the Calendar API and the calendar.readonly scope are set up (see DEPLOY.md 4b).";
     }
   });
+}
+
+/* On page load, reuse a still-valid token from a recent sign-in so a reload
+   doesn't silently drop calendar sync. */
+function restoreGoogleCalendarToken(){
+  try {
+    const saved = JSON.parse(localStorage.getItem("gcalToken") || "null");
+    if (saved && saved.t && saved.exp > Date.now() + 60*1000){
+      setGoogleCalendarToken(saved.t, saved.exp);
+      return true;
+    }
+    localStorage.removeItem("gcalToken");
+  } catch(e){}
+  return false;
 }
 
 /* ---------- auth ---------- */
@@ -676,10 +700,16 @@ if (firebaseReady){
     if (user){
       document.body.classList.remove("demo");
       startFirestoreListeners(user.uid);
+      document.getElementById("calRefreshBtn").style.display = "inline-block";
+      if (!googleAccessToken && !restoreGoogleCalendarToken()){
+        document.getElementById("calStatus").textContent =
+          "Google Calendar not connected — tap \"Refresh Google Calendar\" to pull today's events.";
+      }
     } else {
       if (googleCalPollTimer) clearInterval(googleCalPollTimer);
       googleAccessToken = null;
       googleEvents = [];
+      try { localStorage.removeItem("gcalToken"); } catch(e){}
       document.getElementById("calRefreshBtn").style.display = "none";
       document.getElementById("calStatus").textContent = "";
       startLocalMode();
