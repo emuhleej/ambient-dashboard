@@ -45,6 +45,33 @@ already there):
 
 This means: each signed-in person can only read and write their own data.
 
+## 4b. Turn on real Google Calendar sync
+
+Signing in now also asks for read-only access to your Google Calendar, so
+today's actual events show up next to anything you add by hand. Two things
+to check in the Google Cloud project behind your Firebase project
+(console.cloud.google.com, same project as `emergency-hub-b19b2`):
+
+**a) Enable the API** — APIs & Services → Library → search "Google Calendar
+API" → Enable.
+
+**b) OAuth consent screen** — APIs & Services → OAuth consent screen.
+- Add the scope `.../auth/calendar.readonly`.
+- If the app is in "Testing" mode (normal for a personal project), add your
+  Google account under **Test users** — otherwise Google will block the
+  calendar permission at sign-in.
+
+That's it — no new API key needed, the existing Firebase Google sign-in
+button now requests calendar access too. Google's access tokens expire
+after about an hour; the page refreshes automatically every 5 minutes while
+the tab is open, and if it lapses (e.g. the display was on overnight), a
+**Refresh Google Calendar** button appears in the edit panel to reconnect
+with one click.
+
+Google Calendar events show with a small "Google" tag and can't be deleted
+from the dashboard (edit them in Google Calendar itself); events you add on
+the dashboard work as before.
+
 ## 5. On the iPad
 
 1. Open Safari → https://emuhleej.github.io/ambient-dashboard/
