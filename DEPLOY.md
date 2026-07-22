@@ -62,11 +62,19 @@ API" → Enable.
   calendar permission at sign-in.
 
 That's it — no new API key needed, the existing Firebase Google sign-in
-button now requests calendar access too. Google's access tokens expire
-after about an hour; the page refreshes automatically every 5 minutes while
-the tab is open, and if it lapses (e.g. the display was on overnight), a
-**Refresh Google Calendar** button appears in the edit panel to reconnect
-with one click.
+button now requests calendar access too. Events are pulled from **all** of
+your visible calendars (family, shared, subscribed), not just the primary
+one. Google's access tokens expire after about an hour; the page refreshes
+automatically every 5 minutes while the tab is open, and if it lapses
+(e.g. the display was on overnight), the last-synced events stay on screen
+and a **Refresh Google Calendar** button in the edit panel reconnects with
+one click.
+
+Fetched Google events are also shared through Firebase (stored under
+`users/{your-uid}/gcal`, which the rules in step 4 already cover), so a
+device that can't run the Google sign-in popup — like the iPad home-screen
+app — still shows calendar events as long as any of your signed-in devices
+has synced recently.
 
 Google Calendar events show with a small "Google" tag and can't be deleted
 from the dashboard (edit them in Google Calendar itself); events you add on

@@ -452,7 +452,7 @@ const DEMO_TASKS = [
    on the real site, signed out just means empty lists, not fake events. */
 let localEvents = firebaseReady ? [] : JSON.parse(JSON.stringify(DEMO_EVENTS));
 let localTasks = firebaseReady ? [] : JSON.parse(JSON.stringify(DEMO_TASKS));
-let unsubEvents = null, unsubTasks = null;
+let unsubEvents = null, unsubTasks = null, unsubGcal = null;
 let baseEvents = [];
 let googleEvents = [];
 let googleAccessToken = null;
@@ -472,6 +472,10 @@ function fmtTime(t24){
   return h12+":"+String(mm).padStart(2,"0")+" "+ampm;
 }
 
+function esc(s){
+  return String(s).replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
 function renderEvents(list){
   const ev = document.getElementById("eventlist");
   ev.innerHTML = "";
@@ -485,7 +489,8 @@ function renderEvents(list){
     row.className = "event";
     const gtag = e.source === "google" ? `<span class="gtag">Google</span>` : "";
     const del = e.source === "google" ? "" : `<div class="del" data-id="${e.id}">remove</div>`;
-    row.innerHTML = `<div class="t">${fmtTime(e.time)}</div><div class="n">${e.title}${gtag}</div>${del}`;
+    const when = e.allDay ? "All day" : fmtTime(e.time);
+    row.innerHTML = `<div class="t">${when}</div><div class="n">${esc(e.title)}${gtag}</div>${del}`;
     if (e.source !== "google"){
       row.querySelector(".del").addEventListener("click", ()=> deleteEvent(e.id));
     }
@@ -503,7 +508,7 @@ function renderTasks(list){
   list.slice(0,8).forEach(t=>{
     const row = document.createElement("div");
     row.className = "task";
-    row.innerHTML = `<div class="del" data-id="${t.id}">remove</div><div>${t.title}</div>`;
+    row.innerHTML = `<div class="del" data-id="${t.id}">remove</div><div>${esc(t.title)}</div>`;
     row.querySelector(".del").addEventListener("click", ()=> deleteTask(t.id));
     tl.appendChild(row);
   });
@@ -518,6 +523,7 @@ function startLocalMode(){
 function startFirestoreListeners(uid){
   if (unsubEvents) unsubEvents();
   if (unsubTasks) unsubTasks();
+  if (unsubGcal) unsubGcal();
   const today = todayStr();
   unsubEvents = db.collection("users").doc(uid).collection("events")
     .where("date","==",today)
@@ -529,6 +535,20 @@ function startFirestoreListeners(uid){
       console.warn("events listener error", err);
       document.getElementById("authStatus").textContent = "Sync error (events): " + err.message;
     });
+  /* Google Calendar events fetched by ANY signed-in device are cached in
+     Firestore, so a device without its own Google token (e.g. the iPad
+     ambient display) still shows them. */
+  unsubGcal = db.collection("users").doc(uid).collection("gcal").doc("today")
+    .onSnapshot(doc=>{
+      const d = doc.data();
+      if (!d || d.date !== todayStr()) return;
+      googleEvents = d.events || [];
+      renderCombinedEvents();
+      if (!googleAccessToken && d.syncedAt){
+        document.getElementById("calStatus").textContent =
+          "Google Calendar synced " + new Date(d.syncedAt).toLocaleTimeString() + " (via another device).";
+      }
+    }, err=> console.warn("gcal cache listener error", err));
   unsubTasks = db.collection("users").doc(uid).collection("tasks")
     .orderBy("createdAt","asc")
     .onSnapshot(snap=>{
@@ -592,13 +612,32 @@ function setGoogleCalendarToken(token, expiry){
   fetchGoogleCalendarEvents();
   googleCalPollTimer = setInterval(()=>{
     if (Date.now() > googleTokenExpiry){
-      clearInterval(googleCalPollTimer);
-      document.getElementById("calStatus").textContent =
-        "Google Calendar sync expired — click \"Refresh Google Calendar\" to reconnect.";
+      markGoogleTokenExpired();
       return;
     }
     fetchGoogleCalendarEvents();
   }, 5*60*1000);
+}
+
+/* Token died (~1 hour after sign-in). Keep showing today's last-synced
+   events instead of wiping the list — another signed-in device can also
+   keep them fresh through the Firestore cache. */
+function markGoogleTokenExpired(){
+  googleAccessToken = null;
+  try { localStorage.removeItem("gcalToken"); } catch(e){}
+  if (googleCalPollTimer) clearInterval(googleCalPollTimer);
+  document.getElementById("calStatus").textContent =
+    "Google Calendar sync expired — tap \"Refresh Google Calendar\" to reconnect." +
+    (googleEvents.length ? " Showing today's events from the last sync." : "");
+}
+
+/* Any device that fetched real Google events shares them through Firestore
+   so every signed-in device shows them, token or not. */
+function publishGoogleEvents(events){
+  if (!currentUser || !db) return;
+  db.collection("users").doc(currentUser.uid).collection("gcal").doc("today")
+    .set({ date: todayStr(), events, syncedAt: Date.now() })
+    .catch(err=> console.warn("couldn't share Google events", err));
 }
 
 async function fetchGoogleCalendarEvents(){
@@ -606,6 +645,7 @@ async function fetchGoogleCalendarEvents(){
   try {
     const start = new Date(); start.setHours(0,0,0,0);
     const end = new Date(); end.setHours(23,59,59,999);
+    const headers = { Authorization: "Bearer " + googleAccessToken };
     const params = new URLSearchParams({
       timeMin: start.toISOString(),
       timeMax: end.toISOString(),
@@ -613,43 +653,75 @@ async function fetchGoogleCalendarEvents(){
       orderBy: "startTime",
       maxResults: "20"
     });
-    const res = await fetch(
-      `https://www.googleapis.com/calendar/v3/calendars/primary/events?${params}`,
-      { headers: { Authorization: "Bearer " + googleAccessToken } }
+
+    /* Events can live on any calendar (family, shared, subscribed) — not
+       just "primary". Pull the visible calendar list, then today's events
+       from each. */
+    let calendars = [{id:"primary"}];
+    const listRes = await fetch(
+      "https://www.googleapis.com/calendar/v3/users/me/calendarList",
+      { headers }
     );
-    if (res.status === 401){
-      googleAccessToken = null;
-      googleEvents = [];
-      try { localStorage.removeItem("gcalToken"); } catch(e){}
-      renderCombinedEvents();
-      document.getElementById("calStatus").textContent =
-        "Google Calendar sync expired — click \"Refresh Google Calendar\" to reconnect.";
-      return;
+    if (listRes.status === 401){ markGoogleTokenExpired(); return; }
+    if (listRes.ok){
+      const listData = await listRes.json();
+      const visible = (listData.items || []).filter(c => c.selected !== false);
+      if (visible.length) calendars = visible;
     }
-    if (!res.ok){
-      let msg = "HTTP " + res.status;
-      try {
-        const body = await res.json();
-        if (body.error && body.error.message) msg = body.error.message;
-      } catch(e){}
-      if (res.status === 403 && /not been used|is disabled|accessNotConfigured/i.test(msg)){
+
+    const responses = await Promise.all(calendars.map(cal => fetch(
+      `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(cal.id)}/events?${params}`,
+      { headers }
+    )));
+    if (responses.some(r => r.status === 401)){ markGoogleTokenExpired(); return; }
+
+    const okBodies = [];
+    let firstError = null;
+    for (const r of responses){
+      if (r.ok){ okBodies.push(await r.json()); continue; }
+      if (!firstError){
+        let msg = "HTTP " + r.status;
+        try {
+          const body = await r.json();
+          if (body.error && body.error.message) msg = body.error.message;
+        } catch(e){}
+        firstError = { status: r.status, msg };
+      }
+    }
+
+    if (!okBodies.length && firstError){
+      const {status, msg} = firstError;
+      if (status === 403 && /not been used|is disabled|accessNotConfigured/i.test(msg)){
         document.getElementById("calStatus").textContent =
           "The Google Calendar API isn't enabled for this project yet — enable it at console.cloud.google.com (APIs & Services > Library > Google Calendar API), then tap Refresh again.";
+      } else if (status === 403 && /insufficient|permission/i.test(msg)){
+        document.getElementById("calStatus").textContent =
+          "Signed in, but Google didn't grant calendar access — tap \"Refresh Google Calendar\" and approve the calendar permission. If the OAuth app is in Testing mode, your account must be listed under Test users (see DEPLOY.md 4b).";
       } else {
         document.getElementById("calStatus").textContent = "Google Calendar error: " + msg;
       }
       return;
     }
-    const data = await res.json();
-    googleEvents = (data.items || []).map(ev=>{
-      let time = "";
+
+    const seen = {};
+    const merged = [];
+    okBodies.forEach(data => (data.items || []).forEach(ev => {
+      if (ev.status === "cancelled" || seen[ev.id]) return;
+      seen[ev.id] = true;
+      let time = "", allDay = false;
       if (ev.start && ev.start.dateTime){
         const d = new Date(ev.start.dateTime);
         time = String(d.getHours()).padStart(2,"0") + ":" + String(d.getMinutes()).padStart(2,"0");
+      } else {
+        allDay = true;
       }
-      return { id: "g-" + ev.id, time, title: ev.summary || "(untitled)", source: "google" };
-    });
+      merged.push({ id: "g-" + ev.id, time, allDay, title: ev.summary || "(untitled)", source: "google" });
+    }));
+    merged.sort((a,b)=> (a.time||"").localeCompare(b.time||""));
+
+    googleEvents = merged;
     renderCombinedEvents();
+    publishGoogleEvents(merged);
     document.getElementById("calStatus").textContent =
       "Google Calendar connected — synced " + new Date().toLocaleTimeString();
   } catch (err){
@@ -658,21 +730,33 @@ async function fetchGoogleCalendarEvents(){
   }
 }
 
+function handleGoogleSignIn(result){
+  let credential = result && result.credential; // compat SDK puts the OAuth credential here
+  if (!credential && result && firebase.auth.GoogleAuthProvider.credentialFromResult){
+    try { credential = firebase.auth.GoogleAuthProvider.credentialFromResult(result); } catch(e){}
+  }
+  if (credential && credential.accessToken){
+    setGoogleCalendarToken(credential.accessToken);
+  } else if (result && result.user){
+    document.getElementById("calStatus").textContent =
+      "Signed in, but Google didn't return calendar access — check that the Calendar API and the calendar.readonly scope are set up (see DEPLOY.md 4b).";
+  }
+}
+
 function connectGoogleCalendar(){
   const provider = new firebase.auth.GoogleAuthProvider();
   provider.addScope("https://www.googleapis.com/auth/calendar.readonly");
-  provider.setCustomParameters({ prompt: "consent" });
-  return auth.signInWithPopup(provider).then(result=>{
-    let credential = result.credential; // compat SDK puts the OAuth credential here
-    if (!credential && firebase.auth.GoogleAuthProvider.credentialFromResult){
-      try { credential = firebase.auth.GoogleAuthProvider.credentialFromResult(result); } catch(e){}
+  provider.setCustomParameters({ prompt: "select_account" });
+  return auth.signInWithPopup(provider).then(handleGoogleSignIn).catch(err=>{
+    /* Popups don't work everywhere — notably the iPad home-screen app —
+       so fall back to a full-page redirect; the token is picked up on
+       return by getRedirectResult() below. */
+    const code = err && err.code;
+    if (code === "auth/popup-blocked" ||
+        code === "auth/operation-not-supported-in-this-environment"){
+      return auth.signInWithRedirect(provider);
     }
-    if (credential && credential.accessToken){
-      setGoogleCalendarToken(credential.accessToken);
-    } else {
-      document.getElementById("calStatus").textContent =
-        "Signed in, but Google didn't return calendar access — check that the Calendar API and the calendar.readonly scope are set up (see DEPLOY.md 4b).";
-    }
+    throw err;
   });
 }
 
@@ -720,6 +804,7 @@ if (firebaseReady){
       }
     } else {
       if (googleCalPollTimer) clearInterval(googleCalPollTimer);
+      if (unsubGcal){ unsubGcal(); unsubGcal = null; }
       googleAccessToken = null;
       googleEvents = [];
       try { localStorage.removeItem("gcalToken"); } catch(e){}
@@ -728,6 +813,11 @@ if (firebaseReady){
       startLocalMode();
     }
   });
+  /* Completes a redirect-based sign-in (the popup fallback) — without this
+     the calendar token from a redirect flow was silently thrown away. */
+  auth.getRedirectResult().then(result=>{
+    if (result && (result.credential || result.user)) handleGoogleSignIn(result);
+  }).catch(err=> console.warn("redirect sign-in error", err));
   document.getElementById("signInBtn").addEventListener("click", ()=>{
     connectGoogleCalendar().catch(err=> alert("Sign-in error: "+err.message));
   });
@@ -777,6 +867,18 @@ fetchWeather().then(w=>{
 });
 setInterval(tick, 1000);
 setInterval(paintSky, 60*1000);
+/* Midnight rollover: the Firestore query and the Google-events cache are
+   pinned to the day they were created, so an always-on display would keep
+   showing yesterday without this. */
+let currentDay = todayStr();
+setInterval(()=>{
+  if (todayStr() === currentDay) return;
+  currentDay = todayStr();
+  googleEvents = [];
+  if (currentUser) startFirestoreListeners(currentUser.uid);
+  else startLocalMode();
+  fetchGoogleCalendarEvents();
+}, 60*1000);
 setInterval(()=>{ fetchWeather().then(w=>{
   if (w.temp != null){
     document.getElementById("temp").textContent = Math.round(w.temp) + "\u00b0";
