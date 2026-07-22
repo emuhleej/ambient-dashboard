@@ -626,7 +626,20 @@ async function fetchGoogleCalendarEvents(){
         "Google Calendar sync expired — click \"Refresh Google Calendar\" to reconnect.";
       return;
     }
-    if (!res.ok) throw new Error("HTTP " + res.status);
+    if (!res.ok){
+      let msg = "HTTP " + res.status;
+      try {
+        const body = await res.json();
+        if (body.error && body.error.message) msg = body.error.message;
+      } catch(e){}
+      if (res.status === 403 && /not been used|is disabled|accessNotConfigured/i.test(msg)){
+        document.getElementById("calStatus").textContent =
+          "The Google Calendar API isn't enabled for this project yet — enable it at console.cloud.google.com (APIs & Services > Library > Google Calendar API), then tap Refresh again.";
+      } else {
+        document.getElementById("calStatus").textContent = "Google Calendar error: " + msg;
+      }
+      return;
+    }
     const data = await res.json();
     googleEvents = (data.items || []).map(ev=>{
       let time = "";
